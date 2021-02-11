@@ -557,10 +557,6 @@ class TestSpecSyntax(object):
         with specfile.open('w') as f:
             f.write(s['libelf'].to_yaml(hash=ht.build_hash))
 
-        print("")
-        print("")
-        print("PARSING HERE")
-
         # Make sure we can use yaml path as dependency, e.g.:
         #     "spack spec libdwarf ^ /path/to/libelf.yaml"
         specs = sp.parse('libdwarf ^ {0}'.format(specfile.strpath))

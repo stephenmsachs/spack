@@ -10,10 +10,16 @@ import os
 import re
 import functools
 import inspect
+import operator
 from datetime import datetime, timedelta
 from six import string_types
 import sys
 
+if sys.version_info < (3, 0):
+    from itertools import izip_longest  # novm
+    zip_longest = izip_longest
+else:
+    from itertools import zip_longest  # novm
 
 if sys.version_info >= (3, 3):
     from collections.abc import Hashable, MutableMapping  # novm
@@ -227,48 +233,199 @@ def list_modules(directory, **kwargs):
                 yield re.sub('.py$', '', name)
 
 
-def key_ordering(cls):
-    """Decorates a class with extra methods that implement rich comparison
-       operations and ``__hash__``.  The decorator assumes that the class
-       implements a function called ``_cmp_key()``.  The rich comparison
-       operations will compare objects using this key, and the ``__hash__``
-       function will return the hash of this key.
+#: sentinel for testing that iterators are done
+done = object()
 
-       If a class already has ``__eq__``, ``__ne__``, ``__lt__``, ``__le__``,
-       ``__gt__``, or ``__ge__`` defined, this decorator will overwrite them.
 
-       Raises:
-           TypeError: If the class does not have a ``_cmp_key`` method
+def tuplify(seq):
+    """Helper for lazy_lexicographic_ordering()."""
+    return tuple(tuplify(x) if callable(x) else x for x in seq())
+
+
+def doublewrap(decorator):
+    """A decorator decorator.
+
+    Allows the decorator to be used with or without arguments, e.g.::
+
+        # Calls the decorator function some args
+        @decorator(with, arguments, and=kwargs)
+
+    or::
+
+        # Calls the decorator function with zero arguments
+        @decorator
+
     """
-    def setter(name, value):
-        value.__name__ = name
-        setattr(cls, name, value)
+    # See https://stackoverflow.com/questions/653368 for more on this
+    @functools.wraps(decorator)
+    def new_dec(*args, **kwargs):
+        if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
+            # actual decorated function
+            return decorator(args[0])
+        else:
+            # decorator arguments
+            return lambda realf: decorator(realf, *args, **kwargs)
 
-    if not has_method(cls, '_cmp_key'):
-        raise TypeError("'%s' doesn't define _cmp_key()." % cls.__name__)
+    return new_dec
 
-    setter('__eq__',
-           lambda s, o:
-           (s is o) or (o is not None and s._cmp_key() == o._cmp_key()))
-    setter('__lt__',
-           lambda s, o: o is not None and s._cmp_key() < o._cmp_key())
-    setter('__le__',
-           lambda s, o: o is not None and s._cmp_key() <= o._cmp_key())
 
-    setter('__ne__',
-           lambda s, o:
-           (s is not o) and (o is None or s._cmp_key() != o._cmp_key()))
-    setter('__gt__',
-           lambda s, o: o is None or s._cmp_key() > o._cmp_key())
-    setter('__ge__',
-           lambda s, o: o is None or s._cmp_key() >= o._cmp_key())
+@doublewrap
+def lazy_lexicographic_ordering(cls, set_hash=True):
+    """Decorates a class with extra methods that implement rich comparison.
 
-    setter('__hash__', lambda self: hash(self._cmp_key()))
+    This is a lazy version of the tuple comparison used frequently to
+    implement comparison in Python. Given some objects with fields, you
+    might use tuple keys to implement comparison, e.g.:
+
+        class Widget:
+            def _cmp_key(self):
+                return (
+                    self.a,
+                    self.b,
+                    (self.c, self.d),
+                    self.e
+                )
+
+            def __eq__(self, other):
+                return self._cmp_key() == other._cmp_key()
+
+            def __lt__(self):
+                return self._cmp_key() < other._cmp_key()
+
+            # etc.
+
+    Python would compare ``Widgets`` lexicographically based on their
+    tuples. The issue there for simple comparators is that we have to
+    bulid the tuples *and* we have to generate all the values in them up
+    front. When implementing comparisons for large data structures, this
+    can be costly.
+
+    Lazy lexicographic comparison maps the tuple comparison shown above
+    to generator functions. Instead of comparing based on pre-constructed
+    tuple keys, users of this decorator can compare using elements from a
+    generator. So, you'd write:
+
+        @lazy_lexicographic_ordering
+        class Widget:
+            def _cmp_iter(self):
+                yield a
+                yield b
+                def cd_fun():
+                    yield c
+                    yield d
+                yield cd_fun
+                yield e
+
+            # operators are added by decorator
+
+    There are no tuples preconstructed, and the generator does not have
+    to complete. Instead of tuples, we simply make functions that lazily
+    yield what would've been in the tuple. The
+    ``@lazy_lexicographic_ordering`` decorator handles the details of
+    implementing comparison operators, and the ``Widget`` implementor
+    only has to worry about writing ``_cmp_iter``, and making sure the
+    elements in it are also comparable.
+
+    Note: if a class already has ``__eq__``, ``__ne__``, ``__lt__``,
+    ``__le__``, ``__gt__``, ``__ge__``, or ``__hash__`` defined, this
+    decorator will overwrite them.
+
+    If ``set_hash`` is ``False``, this will not overwrite ``__hash__``.
+
+    Raises:
+        TypeError: If the class does not have a ``_cmp_iter`` method
+
+    """
+    if not has_method(cls, "_cmp_iter"):
+        raise TypeError("'%s' doesn't define _cmp_iter()." % cls.__name__)
+
+    # eq and lt are the main comparison implementations
+    def eq(lseq, rseq):
+        liter = lseq()  # call generators
+        riter = rseq()
+
+        # zip_longest is implemented in native code, so use it for speed.
+        # use zip_longest instead of zip because it allows us to tell
+        # which iterator was longer.
+        for left, right in zip_longest(liter, riter, fillvalue=done):
+            if (left is done) or (right is done):
+                return False
+
+            # recursively enumerate any generators, otherwise compare
+            equal = eq(left, right) if callable(left) else left == right
+            if not equal:
+                return False
+
+        return True
+
+    # lt is implemented much like eq.
+    def lt(lseq, rseq):
+        liter = lseq()
+        riter = rseq()
+
+        for left, right in zip_longest(liter, riter, fillvalue=done):
+            if (left is done) or (right is done):
+                return left is done  # left was shorter than right
+
+            sequence = callable(left)
+            equal = eq(left, right) if sequence else left == right
+            if equal:
+                continue
+            return lt(left, right) if sequence else left < right
+
+        return False  # if equal, return False
+
+    # other comparison operators are implemented in terms of eq and lt
+    def ne(lseq, rseq):
+        return not eq(lseq, rseq)
+
+    def gt(lseq, rseq):
+        return lt(rseq, lseq)
+
+    def le(lseq, rseq):
+        return not gt(lseq, rseq)
+
+    def ge(lseq, rseq):
+        return not lt(lseq, rseq)
+
+    def h(seq):
+        return hash(tuplify(seq))
+
+    # lambdas below handle special cases with None, then delegate to the
+    # recursive functions that take generators above.
+    def add_func_to_class(name, func):
+        """Add a function to a class with a particular name."""
+        func.__name__ = name
+        setattr(cls, name, func)
+
+    add_func_to_class(
+        "__eq__", lambda s, o:
+        (s is o) or (o is not None and eq(s._cmp_iter, o._cmp_iter)))
+    add_func_to_class(
+        "__ne__", lambda s, o:
+        (s is not o) and (o is None or ne(s._cmp_iter, o._cmp_iter)))
+
+    add_func_to_class(
+        "__lt__", lambda s, o:
+        (s is not o) and (o is not None) and lt(s._cmp_iter, o._cmp_iter))
+    add_func_to_class(
+        "__le__", lambda s, o:
+        (s is o) or (o is not None and le(s._cmp_iter, o._cmp_iter)))
+
+    add_func_to_class(
+        "__gt__", lambda s, o:
+        (s is not o) and (o is None or gt(s._cmp_iter, o._cmp_iter)))
+    add_func_to_class(
+        "__ge__", lambda s, o:
+        (s is o) or (o is None) or ge(s._cmp_iter, o._cmp_iter))
+
+    if set_hash:
+        add_func_to_class("__hash__", lambda s: h(s._cmp_iter))
 
     return cls
 
 
-@key_ordering
+@lazy_lexicographic_ordering
 class HashableMap(MutableMapping):
     """This is a hashable, comparable dictionary.  Hash is performed on
        a tuple of the values in the dictionary."""
@@ -291,8 +448,9 @@ class HashableMap(MutableMapping):
     def __delitem__(self, key):
         del self.dict[key]
 
-    def _cmp_key(self):
-        return tuple(sorted(self.values()))
+    def _cmp_iter(self):
+        for _, v in sorted(self.items()):
+            yield v
 
     def copy(self):
         """Type-agnostic clone method.  Preserves subclass type."""

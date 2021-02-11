@@ -203,7 +203,7 @@ def colorize_spec(spec):
     return clr.colorize(re.sub(_separators, insert_color(), str(spec)) + '@.')
 
 
-@lang.key_ordering
+@lang.lazy_lexicographic_ordering
 class ArchSpec(object):
     def __init__(self, spec_or_platform_tuple=(None, None, None)):
         """ Architecture specification a package should be built with.
@@ -252,8 +252,10 @@ class ArchSpec(object):
             return spec_like
         return ArchSpec(spec_like)
 
-    def _cmp_key(self):
-        return self.platform, self.os, self.target
+    def _cmp_iter(self):
+        yield self.platform
+        yield self.os
+        yield self.target
 
     def _dup(self, other):
         self.platform = other.platform
@@ -534,7 +536,7 @@ class ArchSpec(object):
         return string in str(self) or string in self.target
 
 
-@lang.key_ordering
+@lang.lazy_lexicographic_ordering
 class CompilerSpec(object):
     """The CompilerSpec field represents the compiler or range of compiler
        versions that a package should be built with.  CompilerSpecs have a
@@ -623,8 +625,9 @@ class CompilerSpec(object):
         clone.versions = self.versions.copy()
         return clone
 
-    def _cmp_key(self):
-        return (self.name, self.versions)
+    def _cmp_iter(self):
+        yield self.name
+        yield self.versions
 
     def to_dict(self):
         d = syaml.syaml_dict([('name', self.name)])
@@ -648,7 +651,7 @@ class CompilerSpec(object):
         return str(self)
 
 
-@lang.key_ordering
+@lang.lazy_lexicographic_ordering
 class DependencySpec(object):
     """DependencySpecs connect two nodes in the DAG, and contain deptypes.
 
@@ -686,10 +689,10 @@ class DependencySpec(object):
             self.deptypes + dp.canonical_deptype(type)
         )
 
-    def _cmp_key(self):
-        return (self.parent.name if self.parent else None,
-                self.spec.name if self.spec else None,
-                self.deptypes)
+    def _cmp_iter(self):
+        yield self.parent.name if self.parent else None
+        yield self.spec.name if self.spec else None
+        yield self.deptypes
 
     def __str__(self):
         return "%s %s--> %s" % (self.parent.name if self.parent else None,
@@ -747,8 +750,15 @@ class FlagMap(lang.HashableMap):
             clone[name] = value
         return clone
 
-    def _cmp_key(self):
-        return tuple((k, tuple(v)) for k, v in sorted(six.iteritems(self)))
+    def _cmp_iter(self):
+        for k, v in sorted(self.items()):
+            yield k
+
+            def flags():
+                for flag in v:
+                    yield flag
+
+            yield flags
 
     def __str__(self):
         sorted_keys = [k for k in sorted(self.keys()) if self[k] != []]
@@ -1016,7 +1026,7 @@ class SpecBuildInterface(lang.ObjectWrapper):
         )
 
 
-@lang.key_ordering
+@lang.lazy_lexicographic_ordering(set_hash=False)
 class Spec(object):
 
     #: Cache for spec's prefix, computed lazily in the corresponding property
@@ -1060,7 +1070,7 @@ class Spec(object):
 
         self._hash = None
         self._build_hash = None
-        self._cmp_key_cache = None
+        self._dunder_hash = None
         self._package = None
 
         # Most of these are internal implementation details that can be
@@ -3358,7 +3368,7 @@ class Spec(object):
                 before possibly copying the dependencies of ``other`` onto
                 ``self``
             caches (bool or None): preserve cached fields such as
-                ``_normal``, ``_hash``, and ``_cmp_key_cache``. By
+                ``_normal``, ``_hash``, and ``_dunder_hash``. By
                 default this is ``False`` if DAG structure would be
                 changed by the copy, ``True`` if it's an exact copy.
 
@@ -3432,13 +3442,13 @@ class Spec(object):
         if caches:
             self._hash = other._hash
             self._build_hash = other._build_hash
-            self._cmp_key_cache = other._cmp_key_cache
+            self._dunder_hash = other._dunder_hash
             self._normal = other._normal
             self._full_hash = other._full_hash
         else:
             self._hash = None
             self._build_hash = None
-            self._cmp_key_cache = None
+            self._dunder_hash = None
             self._normal = False
             self._full_hash = None
 
@@ -3630,24 +3640,20 @@ class Spec(object):
         """Inequality with another spec, not including dependencies."""
         return self._cmp_node() != other._cmp_node()
 
-    def _cmp_key(self):
-        """This returns a key for the spec *including* DAG structure.
+    def _cmp_iter(self):
+        """Lazily yield components of self for comparison."""
+        yield self.name or ''
+        yield self.namespace or ''
+        yield self.versions
+        yield self.variants
+        yield self.architecture
+        yield self.compiler
+        yield self.compiler_flags
 
-        The key is the concatenation of:
-          1. A tuple describing this node in the DAG.
-          2. The hash of each of this node's dependencies' cmp_keys.
-        """
-        if self._cmp_key_cache:
-            return self._cmp_key_cache
-
-        dep_tuple = tuple(
-            (d.spec.name, hash(d.spec), tuple(sorted(d.deptypes)))
-            for name, d in sorted(self._dependencies.items()))
-
-        key = (self._cmp_node(), dep_tuple)
-        if self._concrete:
-            self._cmp_key_cache = key
-        return key
+        def deps():
+            for _, dep in sorted(self._dependencies.items()):
+                yield dep._cmp_iter
+        yield deps
 
     def colorized(self):
         return colorize_spec(self)
@@ -4338,6 +4344,16 @@ class Spec(object):
         for attr in ht.SpecHashDescriptor.hash_types:
             if hasattr(self, attr):
                 setattr(self, attr, None)
+
+    def __hash__(self):
+        """Memoized version of lazy_lexicographic_ordering hash."""
+        if self._dunder_hash:
+            return self._dunder_hash
+
+        h = hash(lang.tuplify(self._cmp_iter))
+        if self._concrete:
+            self._dunder_hash = h
+        return h
 
 
 class LazySpecCache(collections.defaultdict):
