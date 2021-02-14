@@ -3640,9 +3640,17 @@ class Spec(object):
         """Inequality with another spec, not including dependencies."""
         return self._cmp_node() != other._cmp_node()
 
-    def _cmp_iter(self):
+    def _cmp_iter(self, visited=None):
         """Lazily yield components of self for comparison."""
+        if visited is None:
+            visited = set()
+
         yield self.name or ''
+
+        if id(self) in visited:
+            return
+        visited.add(id(self))
+
         yield self.namespace or ''
         yield self.versions
         yield self.variants
@@ -3652,7 +3660,8 @@ class Spec(object):
 
         def deps():
             for _, dep in sorted(self._dependencies.items()):
-                yield dep._cmp_iter
+                yield dep.deptypes
+                yield lambda: dep.spec._cmp_iter(visited)
         yield deps
 
     def colorized(self):
